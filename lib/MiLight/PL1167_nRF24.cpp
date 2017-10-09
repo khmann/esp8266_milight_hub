@@ -14,6 +14,7 @@ PL1167_nRF24::PL1167_nRF24(RF24 &radio)
   : _radio(radio)
 { }
 
+// kh: initialize the radio, for purposes of speaking Mi.Light.  "highpower" radio users should strongly consider RF24_PA_HIGH instead.
 int PL1167_nRF24::open()
 {
   _radio.begin();
@@ -22,80 +23,84 @@ int PL1167_nRF24::open()
   _radio.setDataRate(RF24_1MBPS);
   _radio.disableCRC();
 
-  _syncwordLength=5
+  _syncwordLength=5;
   _radio.setAddressWidth(_syncwordLength);
 
   return recalc_parameters();
 }
 
+// kh: henryk created a very precise emulation, but we don't need all that.  solve the "trailer" alignment problem by statically shifting the syncword and reduce the preamble to 12 bits.
 int PL1167_nRF24::recalc_parameters()
 {
-  int packet_length = _maxPacketLength + 2;
-  int nrf_address_pos = _syncwordLength;
+  int packet_length = _maxPacketLength + 2; // (_crc ? 2 : 0);
+  if ( _receive_length != packet_length ) {
+    _receive_length = packet_length;
+    _radio.setPayloadSize( _receive_length );
+  }
 
+  int nrf_address_pos = _syncwordLength;
   if (_syncword0 & 0x01) {
-    _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword0 << 4) & 0xf0 ) + 0x05 );
+    _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword0 << 4) & 0xf0 ) + 0x05 ); // &1 yes
   } else {
-    _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword0 << 4) & 0xf0 ) + 0x0a );
+    _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword0 << 4) & 0xf0 ) + 0x0a ); // &1 no
   }
   _nrf_pipe[ --nrf_address_pos ] = reverse_bits( (_syncword0 >> 4) & 0xff);
   _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword0 >> 12) & 0x0f ) + ( (_syncword3 << 4) & 0xf0) );
   _nrf_pipe[ --nrf_address_pos ] = reverse_bits( (_syncword3 >> 4) & 0xff);
-  _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword3 >> 12) & 0x0f ) + 0x50 );	// kh: spi says trailer is always "5" ?
 
-  _receive_length = packet_length;
+  if (_syncword3 & 0x8000) {
+    _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword3 >> 12) & 0x0f ) + 0xa0 ); // &8000 yes
+  } else {
+    _nrf_pipe[ --nrf_address_pos ] = reverse_bits( ( (_syncword3 >> 12) & 0x0f ) + 0x50 ); // &8000 no
+  }
 
   _radio.openWritingPipe(_nrf_pipe);
   _radio.openReadingPipe(1, _nrf_pipe);
 
-  _radio.setChannel(2 + _channel);
-
-  _radio.setPayloadSize( packet_length );
   return 0;
 }
 
-
+// kh: no thanks, I'll take care of this
 int PL1167_nRF24::setPreambleLength(uint8_t preambleLength)
 { return 0; }
-/* kh- no thanks, I'll take care of this */
-
 
 int PL1167_nRF24::setSyncword(uint16_t syncword0, uint16_t syncword3)
 {
-  _syncwordLength=5
-  _syncword0 = syncword0;
-  _syncword3 = syncword3;
-  return recalc_parameters();
+  _syncwordLength = 5;
+  if ( (_syncword0 != syncword0) | (_syncword3 != syncword3) ) {
+    _syncword0 = syncword0;
+    _syncword3 = syncword3;
+    return recalc_parameters();
+  }
+  return 0;
 }
 
+// kh: no thanks, I'll take care of that
 int PL1167_nRF24::setTrailerLength(uint8_t trailerLength)
 { return 0; }
-/* kh- no thanks, I'll take care of that.
-   One could argue there is potential value to "defining" the trailer - such that
-   we can use those "values" for internal (repeateR?) functions since they are
-   ignored by the real PL1167..  But there is no value in _this_ implementation...
-*/
 
+// note that CRCs are always added on TX, this is only to control RX validation
 int PL1167_nRF24::setCRC(bool crc)
 {
   _crc = crc;
-  return recalc_parameters();
+  return 0;
 }
 
+// this has to stay because of order-of-operations compatibility with 3rd party code
 int PL1167_nRF24::setMaxPacketLength(uint8_t maxPacketLength)
 {
-  _maxPacketLength = maxPacketLength;
-  return recalc_parameters();
+  if ( _maxPacketLength != maxPacketLength ) {
+    _maxPacketLength = maxPacketLength;
+    return recalc_parameters();
+  }
+  return 0;
 }
 
 int PL1167_nRF24::receive(uint8_t channel)
 {
-  if (channel != _channel) {
+  if (_channel != channel) {
     _channel = channel;
-    int retval = recalc_parameters();
-    if (retval < 0) {
-      return retval;
-    }
+    _radio.setChannel(2 + channel);
   }
 
   _radio.startListening();
@@ -145,16 +150,7 @@ int PL1167_nRF24::writeFIFO(const uint8_t data[], size_t data_length)
 
 int PL1167_nRF24::transmit(uint8_t channel)
 {
-  if (channel != _channel) {
-    _channel = channel;
-    int retval = recalc_parameters();
-    if (retval < 0) {
-      return retval;
-    }
-    yield();
-  }
-
-  _radio.stopListening();
+  // make bits
   uint8_t tmp[sizeof(_packet)];
   int outp=0;
 
@@ -171,12 +167,19 @@ int PL1167_nRF24::transmit(uint8_t channel)
     }
   }
 
-  yield();
+  //send bits
+  _radio.stopListening();
+
+  if (_channel != channel) {
+    _channel = channel;
+    _radio.setChannel(2 + channel);
+  }
 
   _radio.write(tmp, outp);
+  _radio.write(tmp, outp);	// this is probably "free"
+  _radio.write(tmp, outp);	// this is probably also free
   return 0;
 }
-
 
 int PL1167_nRF24::internal_receive()
 {
@@ -186,7 +189,7 @@ int PL1167_nRF24::internal_receive()
   _radio.read(tmp, _receive_length);
 
   // HACK HACK HACK: Reset radio
-  open();
+//  open();
 
 #ifdef DEBUG_PRINTF
   printf("Packet received: ");
@@ -208,7 +211,6 @@ int PL1167_nRF24::internal_receive()
   }
   printf("\n");
 #endif
-
 
   if (_crc) {
     if (outp < 2) {
